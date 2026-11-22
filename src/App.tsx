@@ -11,7 +11,7 @@ import {
   OptionsView,
   OverviewView,
 } from './components/SecondaryViews.tsx';
-import { missionApi, setAuthToken } from './services/api.ts';
+import { missionApi, setAuthToken, setUnauthorizedHandler } from './services/api.ts';
 import { createMissionSocket } from './services/socket.ts';
 import {
   computeMissionPathStats,
@@ -64,6 +64,22 @@ export default function App() {
       setToast((curr) => (curr === msg ? null : curr));
     }, 3000);
   }, []);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setToken(null);
+      setUser(null);
+      showToast('Session expired — please sign in again');
+    });
+    return () => setUnauthorizedHandler(null);
+  }, [showToast]);
+
+  // Reset draw planner whenever operator switches to a different mission
+  useEffect(() => {
+    setDrawMode('off');
+    setDraftWaypoints([]);
+    setDraftPolygon([]);
+  }, [selectedMissionId]);
 
   const loadWorkspaceData = useCallback(async () => {
     const [vehRes, misRes, logRes, keyRes] = await Promise.all([
@@ -324,6 +340,8 @@ export default function App() {
       setDraftPolygon([]);
       setDrawMode('off');
       showToast('Restored default Route № 17 survey grid');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to restore Route № 17');
     } finally {
       setSavingDrawnPath(false);
     }

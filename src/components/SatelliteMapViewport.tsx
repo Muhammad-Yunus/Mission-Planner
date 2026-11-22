@@ -476,19 +476,33 @@ const FlightOverlayLayer: React.FC<{
 };
 
 const MapCameraController: React.FC<{
+  missionId: number;
+  missionCenter: { lat: number; lng: number };
   center: { lat: number; lng: number };
   is3D: boolean;
   recenterSignal: number;
-}> = ({ center, is3D, recenterSignal }) => {
+}> = ({ missionId, missionCenter, center, is3D, recenterSignal }) => {
   const map = useMap();
   const centerRef = useRef(center);
   centerRef.current = center;
+  const missionCenterRef = useRef(missionCenter);
+  missionCenterRef.current = missionCenter;
+  const prevMissionIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!map) return;
     map.setTilt(is3D ? 45 : 0);
     map.setHeading(is3D ? 315 : 0);
   }, [map, is3D]);
+
+  useEffect(() => {
+    if (!map) return;
+    if (prevMissionIdRef.current !== null && prevMissionIdRef.current !== missionId) {
+      map.panTo(missionCenterRef.current);
+      map.setZoom(17);
+    }
+    prevMissionIdRef.current = missionId;
+  }, [map, missionId]);
 
   useEffect(() => {
     if (!map || recenterSignal === 0) return;
@@ -532,6 +546,7 @@ const MapInner: React.FC<SatelliteMapViewportProps> = ({
   }
 
   const activeWaypoints = drawMode !== 'off' ? draftWaypoints : (mission.waypointsJson || []);
+  const mapId = import.meta.env.VITE_GOOGLE_MAPS_MAP_ID || 'DEMO_MAP_ID';
 
   return (
     <div
@@ -540,7 +555,7 @@ const MapInner: React.FC<SatelliteMapViewportProps> = ({
       }`}
     >
       <GoogleMap
-        mapId="DEMO_MAP_ID"
+        mapId={mapId}
         defaultCenter={{ lat: mission.centerLat, lng: mission.centerLng }}
         defaultZoom={17}
         mapTypeId="satellite"
@@ -562,6 +577,8 @@ const MapInner: React.FC<SatelliteMapViewportProps> = ({
       />
 
       <MapCameraController
+        missionId={mission.id}
+        missionCenter={{ lat: mission.centerLat, lng: mission.centerLng }}
         center={{
           lat: vehicle?.lat ?? mission.centerLat,
           lng: vehicle?.lng ?? mission.centerLng,

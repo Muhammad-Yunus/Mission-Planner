@@ -5,6 +5,12 @@ import type { Request, Response, NextFunction } from 'express';
 import { db } from '../db/index.ts';
 import { ingestApiKeys } from '../db/schema.ts';
 
+if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+  console.warn(
+    '[Mission Planner] WARNING: JWT_SECRET is not set in production. Ephemeral secret generated; operator sessions will invalidate on server restart or across replicas.'
+  );
+}
+
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
 export interface JwtUserPayload {

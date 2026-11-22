@@ -178,7 +178,15 @@ export const LogbookView: React.FC<{ logs: FlightLog[] }> = ({ logs }) => {
   const [query, setQuery] = useState('');
   const [filterType, setFilterType] = useState('ALL');
 
-  const eventTypes = ['ALL', 'MISSION_START', 'MISSION_PAUSE', 'WAYPOINT_REACHED', 'CONFIG_SAVED', 'MISSION_RESET'];
+  const eventTypes = [
+    'ALL',
+    'MISSION_START',
+    'MISSION_PAUSE',
+    'WAYPOINT_REACHED',
+    'PATH_UPDATED',
+    'CONFIG_SAVED',
+    'MISSION_RESET',
+  ];
 
   const filtered = logs.filter((log) => {
     const matchesType = filterType === 'ALL' || log.eventType === filterType;
@@ -189,12 +197,17 @@ export const LogbookView: React.FC<{ logs: FlightLog[] }> = ({ logs }) => {
     return matchesType && matchesSearch;
   });
 
+  const csvCell = (val: string) => {
+    const safe = /^[=+\-@\t\r]/.test(val) ? `'${val}` : val;
+    return `"${safe.replace(/"/g, '""')}"`;
+  };
+
   const handleExportCsv = () => {
     const header = 'ID,Timestamp,EventType,VehicleID,Message\n';
     const rows = filtered
       .map(
         (l) =>
-          `${l.id},"${new Date(l.createdAt).toISOString()}","${l.eventType}",${l.vehicleId},"${l.message.replace(/"/g, '""')}"`
+          `${l.id},${csvCell(new Date(l.createdAt).toISOString())},${csvCell(l.eventType)},${l.vehicleId},${csvCell(l.message)}`
       )
       .join('\n');
     const blob = new Blob([header + rows], { type: 'text/csv;charset=utf-8;' });
@@ -314,17 +327,34 @@ export const OptionsView: React.FC<{
   const [createdRawKey, setCreatedRawKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [revokingId, setRevokingId] = useState<number | null>(null);
+  const [keyError, setKeyError] = useState<string | null>(null);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
     setCreating(true);
+    setKeyError(null);
     try {
       const raw = await onCreateKey(name.trim(), vehicleCode.trim() || undefined);
       setCreatedRawKey(raw);
       setName('');
+    } catch (err) {
+      setKeyError(err instanceof Error ? err.message : 'Failed to create API key');
     } finally {
       setCreating(false);
+    }
+  };
+
+  const handleRevoke = async (id: number) => {
+    setRevokingId(id);
+    setKeyError(null);
+    try {
+      await onRevokeKey(id);
+    } catch (err) {
+      setKeyError(err instanceof Error ? err.message : 'Failed to revoke API key');
+    } finally {
+      setRevokingId(null);
     }
   };
 
@@ -374,6 +404,12 @@ export const OptionsView: React.FC<{
               {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
               {copied ? 'Copied' : 'Copy Key'}
             </button>
+          </div>
+        )}
+
+        {keyError && (
+          <div className="bg-rose-500/10 border border-rose-500/30 rounded-xl px-4 py-2.5 text-xs text-rose-300">
+            {keyError}
           </div>
         )}
 
@@ -453,11 +489,12 @@ export const OptionsView: React.FC<{
                   {k.isActive && (
                     <button
                       type="button"
-                      onClick={() => onRevokeKey(k.id)}
-                      className="h-8 px-3 rounded-lg bg-[#272930] hover:bg-rose-500/20 text-rose-300 text-xs inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                      disabled={revokingId === k.id}
+                      onClick={() => handleRevoke(k.id)}
+                      className="h-8 px-3 rounded-lg bg-[#272930] hover:bg-rose-500/20 disabled:opacity-50 text-rose-300 text-xs inline-flex items-center gap-1.5 transition-colors cursor-pointer"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
-                      Revoke
+                      {revokingId === k.id ? 'Revoking...' : 'Revoke'}
                     </button>
                   )}
                 </div>
@@ -474,7 +511,9 @@ export const OptionsView: React.FC<{
 /* HELP & INTEGRATION GUIDE VIEW                                              */
 /* -------------------------------------------------------------------------- */
 export const HelpView: React.FC<{ onSelectTab: (tab: NavTab) => void }> = ({ onSelectTab }) => {
-  const sampleCurl = `curl -X POST http://localhost:3000/api/v1/ingest/telemetry \\
+  const origin =
+    typeof window !== 'undefined' ? window.location.origin : 'https://your-domain.com';
+  const sampleCurl = `curl -X POST ${origin}/api/v1/ingest/telemetry \\
   -H "Content-Type: application/json" \\
   -H "X-API-Key: <YOUR_INGEST_API_KEY>" \\
   -d '{

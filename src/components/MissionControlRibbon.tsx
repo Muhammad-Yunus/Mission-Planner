@@ -122,7 +122,17 @@ export const MissionControlRibbon: React.FC<MissionControlRibbonProps> = ({
     setPlanAbove(mission.planAbove);
     setPerpendicular(mission.perpendicularLines);
     setReverseFlight(mission.reverseFlight);
-  }, [mission]);
+  }, [
+    mission.id,
+    mission.name,
+    mission.resolutionCmPx,
+    mission.latOverlapPct,
+    mission.longOverlapPct,
+    mission.camera,
+    mission.planAbove,
+    mission.perpendicularLines,
+    mission.reverseFlight,
+  ]);
 
   const handleSaveDefault = async () => {
     setSaving(true);

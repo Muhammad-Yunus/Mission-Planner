@@ -369,8 +369,8 @@ export const TelemetryHudOverlays: React.FC<TelemetryHudOverlaysProps> = ({
 
           {/* X-axis timestamps */}
           <div className="mt-1.5 pl-6 pr-11 flex items-center justify-between text-[9.5px] text-[#8E9299] tabular-nums">
-            {timeLabels.map((lbl) => (
-              <span key={lbl} className={lbl === 'Now' ? 'text-[#85A2E6] font-semibold' : ''}>
+            {timeLabels.map((lbl, idx) => (
+              <span key={`${lbl}-${idx}`} className={lbl === 'Now' ? 'text-[#85A2E6] font-semibold' : ''}>
                 {lbl}
               </span>
             ))}

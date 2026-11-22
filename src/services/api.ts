@@ -9,6 +9,7 @@ import type {
 
 // Hold Bearer JWT strictly in JS memory (never localStorage/sessionStorage)
 let inMemoryToken: string | null = null;
+let unauthorizedHandler: (() => void) | null = null;
 
 export function setAuthToken(token: string | null) {
   inMemoryToken = token;
@@ -16,6 +17,10 @@ export function setAuthToken(token: string | null) {
 
 export function getAuthToken(): string | null {
   return inMemoryToken;
+}
+
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  unauthorizedHandler = handler;
 }
 
 async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -34,6 +39,10 @@ async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (res.status === 401 && inMemoryToken && !path.startsWith('/api/auth/login') && !path.startsWith('/api/auth/register')) {
+      inMemoryToken = null;
+      unauthorizedHandler?.();
+    }
     throw new Error(data.error || `Request failed (${res.status})`);
   }
   return data as T;

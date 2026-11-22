@@ -73,6 +73,16 @@ export const swaggerDocument = {
     },
   },
   paths: {
+    '/api/health': {
+      get: {
+        tags: ['App Auth'],
+        summary: 'Liveness & PostgreSQL readiness check',
+        responses: {
+          '200': { description: 'Server and PostgreSQL healthy' },
+          '503': { description: 'PostgreSQL connection unavailable' },
+        },
+      },
+    },
     '/api/auth/register': {
       post: {
         tags: ['App Auth'],

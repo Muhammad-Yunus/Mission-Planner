@@ -1,4 +1,4 @@
-import { count, eq } from 'drizzle-orm';
+import { count } from 'drizzle-orm';
 import { db } from './index.ts';
 import { vehicles, missions, telemetryPoints, flightLogs, type WaypointNode } from './schema.ts';
 import { generateRoute17Waypoints, buildSmoothFlightTrack } from '../shared/flightTrack.ts';
@@ -16,43 +16,11 @@ function getInitialDroneTrackPoint() {
 
 export async function seedIfNeeded() {
   const [{ value: vehicleCount }] = await db.select({ value: count() }).from(vehicles);
-  const initialDronePt = getInitialDroneTrackPoint();
-
   if (vehicleCount > 0) {
-    // Ensure Route 17 & Route 18 waypoints stay synced with the smooth rounded mapping geometry
-    const [existingRoute17] = await db
-      .select()
-      .from(missions)
-      .where(eq(missions.routeCode, 'Route № 17'))
-      .limit(1);
-
-    if (
-      existingRoute17 &&
-      existingRoute17.waypointsJson?.[2]?.lat !== ROUTE_17_WAYPOINTS[2]?.lat
-    ) {
-      await db
-        .update(missions)
-        .set({ waypointsJson: ROUTE_17_WAYPOINTS, updatedAt: new Date() })
-        .where(eq(missions.routeCode, 'Route № 17'));
-
-      await db
-        .update(missions)
-        .set({ waypointsJson: ROUTE_17_WAYPOINTS, updatedAt: new Date() })
-        .where(eq(missions.routeCode, 'Route № 18'));
-
-      await db
-        .update(vehicles)
-        .set({
-          lat: initialDronePt.lat,
-          lng: initialDronePt.lng,
-          headingDeg: Math.round(initialDronePt.headingDeg),
-          activeWaypointIndex: 11,
-          updatedAt: new Date(),
-        })
-        .where(eq(vehicles.code, 'Modelo AX3'));
-    }
     return;
   }
+
+  const initialDronePt = getInitialDroneTrackPoint();
 
   const [ax3] = await db
     .insert(vehicles)

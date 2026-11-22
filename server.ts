@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import express from 'express';
@@ -32,6 +33,35 @@ import { swaggerDocument } from './src/server/swagger.ts';
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
 
+type AsyncRouteHandler = (
+  req: AuthenticatedRequest,
+  res: express.Response,
+  next: express.NextFunction
+) => Promise<void>;
+
+function asyncHandler(fn: AsyncRouteHandler): express.RequestHandler {
+  return (req, res, next) => {
+    Promise.resolve(fn(req as AuthenticatedRequest, res, next)).catch(next);
+  };
+}
+
+function getConfiguredOrigins(): Set<string> {
+  const allowed = new Set<string>();
+  const rawList = [process.env.ALLOWED_ORIGINS, process.env.APP_URL]
+    .filter(Boolean)
+    .join(',');
+  for (const item of rawList.split(',')) {
+    const trimmed = item.trim();
+    if (!trimmed || trimmed.startsWith('MY_')) continue;
+    try {
+      allowed.add(new URL(trimmed).origin);
+    } catch {
+      // Ignore malformed origin entries
+    }
+  }
+  return allowed;
+}
+
 async function bootstrap() {
   await seedIfNeeded();
 
@@ -45,8 +75,21 @@ async function bootstrap() {
   });
   app.use(express.json({ limit: '2mb' }));
 
-  // Lightweight sliding-window rate limiter for auth endpoints
+  // Lightweight sliding-window rate limiter for auth endpoints with stale-IP pruning
   const authAttempts = new Map<string, number[]>();
+  const pruneInterval = setInterval(() => {
+    const cutoff = Date.now() - 60_000;
+    for (const [ip, timestamps] of authAttempts.entries()) {
+      const fresh = timestamps.filter((ts) => ts > cutoff);
+      if (fresh.length === 0) {
+        authAttempts.delete(ip);
+      } else {
+        authAttempts.set(ip, fresh);
+      }
+    }
+  }, 60_000);
+  pruneInterval.unref();
+
   const authRateLimit: express.RequestHandler = (req, res, next) => {
     const ip = req.ip || 'unknown';
     const now = Date.now();
@@ -60,14 +103,44 @@ async function bootstrap() {
     next();
   };
 
+  const configuredOrigins = getConfiguredOrigins();
+  const isOriginAllowed = (origin: string | undefined, requestHost?: string): boolean => {
+    if (!origin) return true;
+    if (!isProduction) return true;
+    if (configuredOrigins.has(origin)) return true;
+    if (requestHost) {
+      try {
+        if (new URL(origin).host === requestHost) return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  };
+
   const httpServer = http.createServer(app);
   const io = new SocketIOServer(httpServer, {
     cors: {
       origin: (origin, callback) => {
-        // Same-origin or AI Studio preview origins
-        callback(null, origin || true);
+        if (!origin || !isProduction || configuredOrigins.size === 0 || configuredOrigins.has(origin)) {
+          callback(null, origin || true);
+          return;
+        }
+        callback(new Error('Origin not allowed by WebSocket CORS policy'));
       },
       credentials: true,
+    },
+    allowRequest: (req, callback) => {
+      const origin = req.headers.origin;
+      const forwardedHost = req.headers['x-forwarded-host'];
+      const host = Array.isArray(forwardedHost)
+        ? forwardedHost[0]
+        : forwardedHost || req.headers.host;
+      if (isOriginAllowed(origin, host)) {
+        callback(null, true);
+      } else {
+        callback('Origin not allowed by WebSocket policy', false);
+      }
     },
   });
 
@@ -112,10 +185,29 @@ async function bootstrap() {
     customSiteTitle: 'Mission Planner — API Documentation',
   }));
 
-  // Health endpoint
-  app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, service: 'Mission Planner', timestamp: new Date().toISOString() });
-  });
+  // Health & PostgreSQL readiness endpoint
+  app.get(
+    '/api/health',
+    asyncHandler(async (_req, res) => {
+      try {
+        await pool.query('SELECT 1');
+        res.json({
+          ok: true,
+          db: 'connected',
+          service: 'Mission Planner',
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err) {
+        console.error('Healthcheck database probe failed:', err);
+        res.status(503).json({
+          ok: false,
+          db: 'disconnected',
+          service: 'Mission Planner',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    })
+  );
 
   // ---------------------------------------------------------------------------
   // User-Based App Authentication (/api/auth/*)
@@ -126,7 +218,7 @@ async function bootstrap() {
     password: z.string().min(6).max(128),
   });
 
-  app.post('/api/auth/register', authRateLimit, async (req, res) => {
+  app.post('/api/auth/register', authRateLimit, asyncHandler(async (req, res) => {
     const parsed = registerSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid registration data', details: parsed.error.flatten() });
@@ -169,14 +261,14 @@ async function bootstrap() {
         role: created.role,
       },
     });
-  });
+  }));
 
   const loginSchema = z.object({
     email: z.string().email(),
     password: z.string().min(1),
   });
 
-  app.post('/api/auth/login', authRateLimit, async (req, res) => {
+  app.post('/api/auth/login', authRateLimit, asyncHandler(async (req, res) => {
     const parsed = loginSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Email and password are required.' });
@@ -206,21 +298,21 @@ async function bootstrap() {
         role: user.role,
       },
     });
-  });
+  }));
 
-  app.get('/api/auth/me', requireUserAuth, async (req: AuthenticatedRequest, res) => {
+  app.get('/api/auth/me', requireUserAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
     res.json({ user: req.user });
-  });
+  }));
 
   // ---------------------------------------------------------------------------
   // Protected App Routes (User Auth Required)
   // ---------------------------------------------------------------------------
-  app.get('/api/vehicles', requireUserAuth, async (_req, res) => {
+  app.get('/api/vehicles', requireUserAuth, asyncHandler(async (_req, res) => {
     const rows = await db.select().from(vehicles).orderBy(asc(vehicles.id));
     res.json({ vehicles: rows });
-  });
+  }));
 
-  app.get('/api/vehicles/:id/telemetry', requireUserAuth, async (req, res) => {
+  app.get('/api/vehicles/:id/telemetry', requireUserAuth, asyncHandler(async (req, res) => {
     const vehicleId = Number(req.params.id);
     if (!Number.isInteger(vehicleId) || vehicleId <= 0) {
       res.status(400).json({ error: 'Invalid vehicle ID' });
@@ -235,12 +327,12 @@ async function bootstrap() {
       .limit(limit);
 
     res.json({ points: points.reverse() });
-  });
+  }));
 
-  app.get('/api/missions', requireUserAuth, async (_req, res) => {
+  app.get('/api/missions', requireUserAuth, asyncHandler(async (_req, res) => {
     const rows = await db.select().from(missions).orderBy(asc(missions.id));
     res.json({ missions: rows });
-  });
+  }));
 
   const waypointNodeSchema = z.object({
     seq: z.number().int().min(1).max(500),
@@ -275,7 +367,7 @@ async function bootstrap() {
     waypointsJson: z.array(waypointNodeSchema).min(2).max(300).optional(),
   });
 
-  app.patch('/api/missions/:id', requireUserAuth, async (req: AuthenticatedRequest, res) => {
+  app.patch('/api/missions/:id', requireUserAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
     const missionId = Number(req.params.id);
     if (!Number.isInteger(missionId) || missionId <= 0) {
       res.status(400).json({ error: 'Invalid mission ID' });
@@ -346,13 +438,13 @@ async function bootstrap() {
 
     io.emit('mission:updated', updated);
     res.json({ mission: updated });
-  });
+  }));
 
   const commandSchema = z.object({
     command: z.enum(['play', 'pause', 'step', 'reset', 'toggle_lock', 'flag']),
   });
 
-  app.post('/api/missions/:id/command', requireUserAuth, async (req: AuthenticatedRequest, res) => {
+  app.post('/api/missions/:id/command', requireUserAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
     const missionId = Number(req.params.id);
     if (!Number.isInteger(missionId) || missionId <= 0) {
       res.status(400).json({ error: 'Invalid mission ID' });
@@ -477,9 +569,9 @@ async function bootstrap() {
     }
 
     res.json({ mission: updatedMission, vehicle: updatedVehicle });
-  });
+  }));
 
-  app.get('/api/logs', requireUserAuth, async (req, res) => {
+  app.get('/api/logs', requireUserAuth, asyncHandler(async (req, res) => {
     const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 300);
     const logs = await db
       .select()
@@ -487,12 +579,12 @@ async function bootstrap() {
       .orderBy(desc(flightLogs.createdAt))
       .limit(limit);
     res.json({ logs });
-  });
+  }));
 
   // ---------------------------------------------------------------------------
   // Ingest API Key Management (User Auth Required)
   // ---------------------------------------------------------------------------
-  app.get('/api/keys', requireUserAuth, async (req: AuthenticatedRequest, res) => {
+  app.get('/api/keys', requireUserAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
     const baseQuery = db
       .select({
         id: ingestApiKeys.id,
@@ -513,14 +605,14 @@ async function bootstrap() {
             .orderBy(desc(ingestApiKeys.createdAt));
 
     res.json({ keys });
-  });
+  }));
 
   const createKeySchema = z.object({
     name: z.string().min(2).max(100),
     vehicleCode: z.string().max(64).optional().nullable(),
   });
 
-  app.post('/api/keys', requireUserAuth, async (req: AuthenticatedRequest, res) => {
+  app.post('/api/keys', requireUserAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
     const parsed = createKeySchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Key name is required' });
@@ -551,9 +643,9 @@ async function bootstrap() {
       key: created,
       rawKey, // Shown once!
     });
-  });
+  }));
 
-  app.delete('/api/keys/:id', requireUserAuth, async (req: AuthenticatedRequest, res) => {
+  app.delete('/api/keys/:id', requireUserAuth, asyncHandler(async (req: AuthenticatedRequest, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) {
       res.status(400).json({ error: 'Invalid key ID' });
@@ -576,7 +668,7 @@ async function bootstrap() {
       return;
     }
     res.json({ ok: true });
-  });
+  }));
 
   // ---------------------------------------------------------------------------
   // External System Ingest API (X-API-Key Auth Only — Completely Separated!)
@@ -609,7 +701,7 @@ async function bootstrap() {
     status: z.enum(['Connected', 'In Flight', 'Standby', 'Offline']).optional(),
   });
 
-  app.get('/api/v1/ingest/mission/:vehicleCode', requireIngestApiKey, async (req: AuthenticatedRequest, res) => {
+  app.get('/api/v1/ingest/mission/:vehicleCode', requireIngestApiKey, asyncHandler(async (req: AuthenticatedRequest, res) => {
     const vehicleCode = String(req.params.vehicleCode || '').trim();
     if (!vehicleCode) {
       res.status(400).json({ error: 'Vehicle code is required' });
@@ -642,9 +734,9 @@ async function bootstrap() {
       missionType: mission.missionType,
       waypoints: mission.waypointsJson,
     });
-  });
+  }));
 
-  app.post('/api/v1/ingest/telemetry', requireIngestApiKey, async (req: AuthenticatedRequest, res) => {
+  app.post('/api/v1/ingest/telemetry', requireIngestApiKey, asyncHandler(async (req: AuthenticatedRequest, res) => {
     const packetsRaw = Array.isArray(req.body) ? req.body : [req.body];
     if (packetsRaw.length === 0 || packetsRaw.length > 100) {
       res.status(400).json({ error: 'Provide 1 to 100 telemetry packets per request.' });
@@ -688,7 +780,17 @@ async function bootstrap() {
       }
 
       let resolvedMissionId: number | null = pkt.missionId ?? null;
-      if (!resolvedMissionId) {
+      if (resolvedMissionId) {
+        const [explicitMission] = await db
+          .select({ id: missions.id })
+          .from(missions)
+          .where(eq(missions.id, resolvedMissionId))
+          .limit(1);
+        if (!explicitMission) {
+          res.status(404).json({ error: `Mission ID ${resolvedMissionId} not found.` });
+          return;
+        }
+      } else {
         const [linkedMission] = await db
           .select({ id: missions.id })
           .from(missions)
@@ -764,7 +866,7 @@ async function bootstrap() {
           .insert(flightLogs)
           .values({
             vehicleId: veh.id,
-            missionId: pkt.missionId ?? null,
+            missionId: resolvedMissionId,
             eventType: 'WAYPOINT_REACHED',
             message: `${veh.code} progressed to Waypoint ${nextPointData.activeWaypointIndex} (${nextPointData.altitudeAto.toFixed(1)}m ATO)`,
             metadata: {
@@ -789,7 +891,7 @@ async function bootstrap() {
       vehicle: lastUpdatedVehicle,
       latestPoint: insertedPoints[insertedPoints.length - 1],
     });
-  });
+  }));
 
   const missionEventSchema = z.object({
     vehicleCode: z.string().min(1).max(64),
@@ -799,10 +901,17 @@ async function bootstrap() {
     metadata: z.record(z.string(), z.unknown()).optional(),
   });
 
-  app.post('/api/v1/ingest/mission-event', requireIngestApiKey, async (req, res) => {
+  app.post('/api/v1/ingest/mission-event', requireIngestApiKey, asyncHandler(async (req: AuthenticatedRequest, res) => {
     const parsed = missionEventSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid mission event', details: parsed.error.flatten() });
+      return;
+    }
+
+    if (req.ingestKey?.vehicleCode && req.ingestKey.vehicleCode !== parsed.data.vehicleCode) {
+      res.status(403).json({
+        error: `API key is scoped to vehicle "${req.ingestKey.vehicleCode}", not "${parsed.data.vehicleCode}".`,
+      });
       return;
     }
 
@@ -815,6 +924,18 @@ async function bootstrap() {
     if (!veh) {
       res.status(404).json({ error: `Vehicle "${parsed.data.vehicleCode}" not found` });
       return;
+    }
+
+    if (parsed.data.missionId) {
+      const [explicitMission] = await db
+        .select({ id: missions.id })
+        .from(missions)
+        .where(eq(missions.id, parsed.data.missionId))
+        .limit(1);
+      if (!explicitMission) {
+        res.status(404).json({ error: `Mission ID ${parsed.data.missionId} not found.` });
+        return;
+      }
     }
 
     const [log] = await db
@@ -830,7 +951,7 @@ async function bootstrap() {
 
     io.emit('log:created', log);
     res.status(201).json({ log });
-  });
+  }));
 
   // Ensure unmatched /api/* routes return JSON 404 rather than HTML
   app.use('/api', (_req, res) => {
@@ -854,8 +975,13 @@ async function bootstrap() {
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
+    const distDir = path.resolve(import.meta.dirname, 'dist');
+    if (!fs.existsSync(path.join(distDir, 'index.html'))) {
+      console.warn(
+        `[Mission Planner] Production bundle not found at ${distDir}. Run "npm run build" before starting in production.`
+      );
+    }
+    app.use(express.static(distDir, { maxAge: '1h', index: false }));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });
@@ -866,11 +992,22 @@ async function bootstrap() {
     console.log(`Swagger API docs available at http://0.0.0.0:${PORT}/api-docs`);
   });
 
+  let shuttingDown = false;
   const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(`\nReceived ${signal}, shutting down Mission Planner gracefully...`);
+    clearInterval(pruneInterval);
+    const forceTimer = setTimeout(() => {
+      console.error('Forced shutdown after timeout.');
+      process.exit(1);
+    }, 5000);
+    forceTimer.unref();
+
     io.close();
     httpServer.close(async () => {
       await pool.end().catch(() => {});
+      clearTimeout(forceTimer);
       process.exit(0);
     });
   };
